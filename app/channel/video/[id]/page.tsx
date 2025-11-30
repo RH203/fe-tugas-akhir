@@ -6,12 +6,17 @@ import Image from "next/image";
 import Link from "next/link";
 import { useEffect, useState } from "react";
 import { Button } from "@/components/ui/button";
-import { Card, CardHeader } from "@/components/ui/card";
+import { Card, CardHeader, CardContent, CardFooter } from "@/components/ui/card";
 import { Badge } from "@/components/ui/badge";
 import { Separator } from "@/components/ui/separator";
-import { Loader2, ThumbsUp, MessageCircle, Eye, ChevronLeft, ShieldAlert, Ban } from "lucide-react";
+import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
+import { 
+  Loader2, ThumbsUp, MessageCircle, Eye, ChevronLeft, 
+  ShieldAlert, Ban, CheckCircle, XCircle, Trash2, AlertTriangle, ScanSearch 
+} from "lucide-react";
+import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert";
 
-// Tipe Data Detail Video
+// --- TIPE DATA ---
 interface VideoDetail {
   id: string;
   snippet: {
@@ -31,7 +36,12 @@ interface VideoDetail {
   };
 }
 
-// Tipe Data Komentar
+interface AnalysisResult {
+  isGambling: boolean;
+  confidence: string; // String "98.5%"
+  rawScore: number;   // Float 0.985
+}
+
 interface CommentThread {
   id: string;
   snippet: {
@@ -45,6 +55,7 @@ interface CommentThread {
       };
     };
   };
+  analysis?: AnalysisResult; // Field tambahan untuk hasil AI
 }
 
 export default function VideoDetailPage() {
@@ -52,16 +63,26 @@ export default function VideoDetailPage() {
   const videoId = params?.id as string;
   const { data: session, status } = useSession();
 
+  // State Data
   const [video, setVideo] = useState<VideoDetail | null>(null);
-  const [comments, setComments] = useState<CommentThread[]>([]);
-  const [loading, setLoading] = useState(true);
-  const [error, setError] = useState<string | null>(null);
+  const [rawComments, setRawComments] = useState<CommentThread[]>([]); // Komentar mentah dari YT
   
-  // State khusus untuk mendeteksi apakah komentar dimatikan
+  // State Kategori Komentar (Setelah Scan)
+  const [safeComments, setSafeComments] = useState<CommentThread[]>([]);
+  const [reviewComments, setReviewComments] = useState<CommentThread[]>([]);
+  const [spamComments, setSpamComments] = useState<CommentThread[]>([]);
+
+  // State UI
+  const [loading, setLoading] = useState(true);
+  const [isScanning, setIsScanning] = useState(false);
+  const [isScanned, setIsScanned] = useState(false); // Penanda apakah sudah pernah scan
+  const [error, setError] = useState<string | null>(null);
   const [isCommentsDisabled, setIsCommentsDisabled] = useState(false);
 
+  // API URL Flask
+  const API_URL = process.env.NEXT_PUBLIC_API_URL || "http://127.0.0.1:5000";
+
   useEffect(() => {
-    // 1. Cek Status Login & Token
     if (status === "loading") return;
     
     // @ts-ignore
@@ -78,54 +99,44 @@ export default function VideoDetailPage() {
     const fetchData = async () => {
       setLoading(true);
       setError(null);
-      setIsCommentsDisabled(false); // Reset setiap kali fetch baru
+      setIsCommentsDisabled(false);
       
       try {
-        // --- FETCH 1: DETAIL VIDEO ---
+        // 1. Fetch Detail Video
         const videoRes = await fetch(
           `https://www.googleapis.com/youtube/v3/videos?part=snippet,statistics&id=${videoId}`,
           { headers: { Authorization: `Bearer ${accessToken}` } }
         );
-        
         const videoData = await videoRes.json();
-        if (!videoRes.ok) throw new Error(videoData.error?.message || "Gagal mengambil detail video");
+        if (!videoRes.ok) throw new Error(videoData.error?.message);
         
-        // --- FETCH 2: KOMENTAR TERBARU ---
+        // 2. Fetch Komentar (Batch awal 50 biar seru scannya)
         const commentRes = await fetch(
-          `https://www.googleapis.com/youtube/v3/commentThreads?part=snippet&videoId=${videoId}&maxResults=20&order=time`,
+          `https://www.googleapis.com/youtube/v3/commentThreads?part=snippet&videoId=${videoId}&maxResults=50&order=time`,
           { headers: { Authorization: `Bearer ${accessToken}` } }
         );
-
         const commentData = await commentRes.json();
 
-        // LOGIKA PENANGANAN ERROR KOMENTAR
         if (!commentRes.ok) {
-           // Cek apakah errornya karena komentar dinonaktifkan (403 commentsDisabled)
            if (commentData.error?.code === 403 && commentData.error?.errors?.[0]?.reason === 'commentsDisabled') {
-             console.warn("Komentar dinonaktifkan pada video ini.");
              setIsCommentsDisabled(true); 
-             setComments([]); // Kosongkan data, jangan throw error
+             setRawComments([]);
            } else {
-             // Jika error lain (misal quota habis), baru throw error
-             throw new Error(commentData.error?.message || "Gagal mengambil komentar");
+             throw new Error(commentData.error?.message);
            }
         } else {
-           // Jika sukses ambil komentar
            if (commentData.items) {
-             setComments(commentData.items);
+             setRawComments(commentData.items);
+             setSafeComments(commentData.items); // Default semua dianggap aman sebelum scan
            }
         }
 
-        // Set State Video
-        if (videoData.items?.length > 0) {
-          setVideo(videoData.items[0]);
-        } else {
-          setError("Video tidak ditemukan atau telah dihapus.");
-        }
+        if (videoData.items?.length > 0) setVideo(videoData.items[0]);
+        else setError("Video tidak ditemukan.");
 
       } catch (err: any) {
-        console.error("Error fetching details:", err);
-        setError(err.message || "Terjadi kesalahan saat memuat data.");
+        console.error(err);
+        setError(err.message || "Gagal memuat data.");
       } finally {
         setLoading(false);
       }
@@ -134,7 +145,161 @@ export default function VideoDetailPage() {
     fetchData();
   }, [videoId, session, status]);
 
+  // --- FUNGSI UTAMA: SCAN KOMENTAR KE FLASK ---
+  const handleScanComments = async () => {
+    if (rawComments.length === 0) return;
+    
+    setIsScanning(true);
+    setSafeComments([]);
+    setReviewComments([]);
+    setSpamComments([]);
 
+    try {
+      // Kita gunakan Promise.all agar request berjalan paralel (cepat)
+      const analyzedResults = await Promise.all(
+        rawComments.map(async (comment) => {
+          const text = comment.snippet.topLevelComment.snippet.textDisplay;
+          
+          try {
+            const res = await fetch(`${API_URL}/predict`, {
+              method: "POST",
+              headers: { "Content-Type": "application/json" },
+              body: JSON.stringify({ text }),
+            });
+            const data = await res.json();
+            
+            return {
+              ...comment,
+              analysis: {
+                isGambling: data.is_gambling,
+                confidence: data.confidence,
+                rawScore: data.raw_score
+              }
+            };
+          } catch (e) {
+            console.error("Gagal scan komentar:", text);
+            return comment; // Kembalikan tanpa analisis jika error
+          }
+        })
+      );
+
+      // --- LOGIKA FILTERING (Disini kuncinya) ---
+      const safe: CommentThread[] = [];
+      const review: CommentThread[] = [];
+      const spam: CommentThread[] = [];
+
+      analyzedResults.forEach((c) => {
+        if (!c.analysis?.isGambling) {
+            // 1. Jika AI bilang Aman -> Masuk Safe
+            safe.push(c);
+        } else {
+            // Jika Terdeteksi Judi, Cek Scorenya
+            const score = c.analysis.rawScore;
+            
+            if (score > 0.90) { 
+                // 2. Score > 90% (Sangat Yakin) -> AUTO SPAM
+                spam.push(c);
+            } else {
+                // 3. Score 50% - 90% (Meragukan) -> BUTUH REVIEW
+                review.push(c);
+            }
+        }
+      });
+
+      setSafeComments(safe);
+      setReviewComments(review);
+      setSpamComments(spam);
+      setIsScanned(true);
+
+    } catch (err) {
+      console.error("Scan Error", err);
+      // Fallback
+      setSafeComments(rawComments);
+    } finally {
+      setIsScanning(false);
+    }
+  };
+
+  // --- ACTIONS UTK PREVIEW ---
+  const handleApprove = (id: string) => {
+    // Pindahkan dari Review -> Safe
+    const target = reviewComments.find(c => c.id === id);
+    if (target) {
+        setReviewComments(prev => prev.filter(c => c.id !== id));
+        setSafeComments(prev => [target, ...prev]);
+    }
+  };
+
+  const handleDelete = (id: string) => {
+    // Pindahkan dari Review -> Spam (Simulasi Hapus)
+    // Note: Untuk hapus beneran di YouTube, butuh API DELETE dengan scope youtube.force-ssl
+    const target = reviewComments.find(c => c.id === id);
+    if (target) {
+        setReviewComments(prev => prev.filter(c => c.id !== id));
+        setSpamComments(prev => [target, ...prev]);
+    }
+  };
+
+  // --- RENDER CARD KOMENTAR ---
+  const CommentCard = ({ data, type }: { data: CommentThread, type: 'safe' | 'review' | 'spam' }) => {
+    const snippet = data.snippet.topLevelComment.snippet;
+    
+    return (
+        <Card className={`border-l-4 shadow-sm ${
+            type === 'review' ? 'border-l-yellow-500 bg-yellow-50/50 dark:bg-yellow-900/10' : 
+            type === 'spam' ? 'border-l-destructive bg-red-50/50 dark:bg-red-900/10' : 
+            'border-l-green-500 hover:bg-muted/20'
+        }`}>
+            <CardHeader className="p-4 flex flex-row gap-3 space-y-0 items-start">
+                {/* Avatar */}
+                <div className="h-8 w-8 relative rounded-full overflow-hidden flex-shrink-0 bg-muted border">
+                    <Image src={snippet.authorProfileImageUrl} alt={snippet.authorDisplayName} fill className="object-cover" unoptimized />
+                </div>
+                
+                <div className="w-full space-y-1">
+                    {/* Header Nama & Tanggal */}
+                    <div className="flex justify-between items-start">
+                        <div>
+                            <p className="text-sm font-semibold">{snippet.authorDisplayName}</p>
+                            <span className="text-xs text-muted-foreground">{new Date(snippet.publishedAt).toLocaleDateString("id-ID")}</span>
+                        </div>
+                        {/* Tampilkan Score AI jika ada */}
+                        {data.analysis && (
+                            <Badge variant={type === 'safe' ? 'outline' : type === 'review' ? 'secondary' : 'destructive'} className="text-[10px]">
+                                AI: {data.analysis.confidence}
+                            </Badge>
+                        )}
+                    </div>
+
+                    {/* Isi Komentar */}
+                    <p className="text-sm text-foreground/90">{snippet.textDisplay}</p>
+                    
+                    {/* Action Buttons khusus Review */}
+                    {type === 'review' && (
+                        <div className="flex gap-2 pt-2 mt-2 border-t border-yellow-200 dark:border-yellow-900">
+                            <Button size="sm" variant="default" className="h-7 text-xs bg-green-600 hover:bg-green-700" onClick={() => handleApprove(data.id)}>
+                                <CheckCircle className="w-3 h-3 mr-1" /> Bukan Judi
+                            </Button>
+                            <Button size="sm" variant="destructive" className="h-7 text-xs" onClick={() => handleDelete(data.id)}>
+                                <Trash2 className="w-3 h-3 mr-1" /> Hapus (Spam)
+                            </Button>
+                        </div>
+                    )}
+
+                    {type === 'spam' && (
+                         <div className="pt-1">
+                             <span className="text-xs text-destructive font-medium flex items-center gap-1">
+                                <Ban className="w-3 h-3" /> Ditandai untuk dihapus otomatis
+                             </span>
+                         </div>
+                    )}
+                </div>
+            </CardHeader>
+        </Card>
+    )
+  }
+
+  // --- LOADING STATES ---
   if (status === "loading" || loading) {
     return (
       <div className="flex h-[80vh] flex-col items-center justify-center gap-4">
@@ -144,178 +309,120 @@ export default function VideoDetailPage() {
     );
   }
 
-  if (error) {
-    return (
-      <div className="flex h-[50vh] flex-col items-center justify-center gap-4 text-center px-4">
-        <ShieldAlert className="h-16 w-16 text-destructive" />
-        <h3 className="text-xl font-bold text-destructive">Gagal Memuat Data</h3>
-        <p className="text-muted-foreground">{error}</p>
-        <Link href="/channel/video">
-          <Button variant="outline">Kembali ke Daftar Video</Button>
-        </Link>
-      </div>
-    );
-  }
-
-  if (!video) return null;
+  if (error || !video) return <div className="p-8 text-center text-destructive">{error || "Video tidak ditemukan"}</div>;
 
   return (
     <div className="container mx-auto py-8 px-4 max-w-5xl space-y-8">
-      {/* Navigation */}
-      <div className="flex items-center gap-2">
-        <Link href="/channel/video">
-          <Button variant="ghost" className="gap-2 pl-0 hover:bg-transparent hover:text-primary transition-colors">
-            <ChevronLeft className="h-4 w-4" /> Kembali ke Daftar Video
-          </Button>
-        </Link>
+      {/* Tombol Back */}
+      <Link href="/channel/video">
+         <Button variant="ghost" className="pl-0"><ChevronLeft className="h-4 w-4 mr-2" /> Kembali</Button>
+      </Link>
+
+      {/* Header Video Info (Disederhanakan) */}
+      <div className="flex gap-6 items-start">
+         <div className="relative w-48 aspect-video bg-muted rounded-lg overflow-hidden flex-shrink-0 border">
+            <Image src={video.snippet.thumbnails.medium.url} alt="Thumb" fill className="object-cover" />
+         </div>
+         <div>
+            <h1 className="text-xl font-bold line-clamp-2">{video.snippet.title}</h1>
+            <div className="flex gap-3 mt-2">
+                <Badge variant="secondary"><Eye className="w-3 h-3 mr-1"/> {Number(video.statistics.viewCount).toLocaleString()}</Badge>
+                <Badge variant="secondary"><MessageCircle className="w-3 h-3 mr-1"/> {Number(video.statistics.commentCount).toLocaleString()}</Badge>
+            </div>
+         </div>
       </div>
 
-      {/* Video Header Section */}
-      <div className="grid md:grid-cols-3 gap-8">
-        {/* Thumbnail */}
-        <div className="md:col-span-1">
-           <div className="relative aspect-video bg-muted rounded-xl overflow-hidden border shadow-sm">
-             <Image 
-               src={video.snippet.thumbnails.high?.url || video.snippet.thumbnails.medium.url} 
-               alt={video.snippet.title} 
-               fill
-               className="object-cover"
-               priority
-             />
-           </div>
-        </div>
+      <Separator />
 
-        {/* Info Detail */}
-        <div className="md:col-span-2 space-y-5">
-          <div>
-            <h1 className="text-2xl md:text-3xl font-bold leading-tight tracking-tight text-foreground">
-              {video.snippet.title}
-            </h1>
-            <p className="text-sm text-muted-foreground mt-2 font-medium">
-              Dipublikasikan pada {new Date(video.snippet.publishedAt).toLocaleDateString("id-ID", {
-                weekday: 'long', day: 'numeric', month: 'long', year: 'numeric'
-              })}
-            </p>
-          </div>
+      {/* --- BAGIAN UTAMA SCANNER --- */}
+      <div className="space-y-6">
+        <div className="flex flex-col md:flex-row justify-between items-end md:items-center gap-4">
+            <div>
+                <h2 className="text-2xl font-bold flex items-center gap-2">
+                    <ShieldAlert className="h-6 w-6 text-primary" />
+                    Scan Komentar
+                </h2>
+                <p className="text-muted-foreground text-sm">Deteksi promosi judi online menggunakan AI.</p>
+            </div>
 
-          {/* Stats Bar */}
-          <div className="flex flex-wrap gap-4 text-sm font-medium">
-             <Badge variant="secondary" className="px-3 py-1 gap-2 text-sm">
-               <Eye className="h-4 w-4" /> 
-               {Number(video.statistics.viewCount).toLocaleString()} Views
-             </Badge>
-             <Badge variant="secondary" className="px-3 py-1 gap-2 text-sm">
-               <ThumbsUp className="h-4 w-4" /> 
-               {Number(video.statistics.likeCount).toLocaleString()} Likes
-             </Badge>
-             <Badge variant="secondary" className="px-3 py-1 gap-2 text-sm">
-               <MessageCircle className="h-4 w-4" /> 
-               {/* Jika komentar disable*/}
-               {isCommentsDisabled ? "-" : Number(video.statistics.commentCount).toLocaleString()} Komentar
-             </Badge>
-          </div>
-
-          {/* Action Button */}
-          <div className="pt-2">
             <Button 
                 size="lg" 
-                className="w-full md:w-auto bg-destructive hover:bg-destructive/90 gap-2 shadow-lg hover:shadow-destructive/25 transition-all"
-                disabled={isCommentsDisabled || comments.length === 0} 
+                onClick={handleScanComments} 
+                disabled={isScanning || isCommentsDisabled || rawComments.length === 0}
+                className={`min-w-[180px] ${isScanned ? "bg-secondary text-secondary-foreground hover:bg-secondary/80" : "bg-primary"}`}
             >
-              <ShieldAlert className="h-5 w-5" />
-              Scan Komentar Spam Sekarang
+                {isScanning ? (
+                    <><Loader2 className="w-4 h-4 mr-2 animate-spin" /> Sedang Menganalisis...</>
+                ) : (
+                    <><ScanSearch className="w-4 h-4 mr-2" /> {isScanned ? "Scan Ulang" : "Mulai Scan AI"}</>
+                )}
             </Button>
-            {isCommentsDisabled && (
-                <p className="text-xs text-destructive mt-2 font-medium flex items-center gap-1">
-                   <Ban className="h-3 w-3" />
-                   Tidak dapat melakukan scan karena komentar dinonaktifkan oleh pemilik channel.
-                </p>
-            )}
-          </div>
         </div>
-      </div>
-
-      <Separator />
-
-      {/* Description Expandable */}
-      <div className="bg-muted/30 p-4 rounded-lg border">
-        <h3 className="font-semibold mb-2 text-sm uppercase tracking-wider text-muted-foreground">Deskripsi Video</h3>
-        <p className="text-sm text-foreground/80 leading-relaxed whitespace-pre-wrap line-clamp-4 hover:line-clamp-none transition-all cursor-pointer">
-          {video.snippet.description}
-        </p>
-      </div>
-
-      <Separator />
-
-      {/* Comments Section */}
-      <div className="space-y-6">
-        <div className="flex items-center justify-between">
-          <h2 className="text-xl font-bold flex items-center gap-2">
-            <MessageCircle className="h-5 w-5" />
-            Komentar Terbaru
-          </h2>
-          {!isCommentsDisabled && <Badge variant="outline">20 Teratas</Badge>}
-        </div>
-
-        {isCommentsDisabled ? (
-           // TAMPILAN JIKA KOMENTAR DINONAKTIFKAN
-           <div className="flex flex-col items-center justify-center py-16 text-muted-foreground bg-muted/20 rounded-xl border border-dashed gap-2">
-             <Ban className="h-10 w-10 opacity-50" />
-             <p className="font-medium">Komentar dinonaktifkan pada video ini.</p>
-           </div>
-        ) : comments.length === 0 ? (
-          // TAMPILAN JIKA
-          <div className="text-center py-12 text-muted-foreground bg-muted/20 rounded-xl border border-dashed">
-            Belum ada komentar pada video ini.
-          </div>
+        
+        {/* HASIL SCAN (TABS) */}
+        {!isScanned ? (
+             // TAMPILAN BELUM SCAN
+             <div className="bg-muted/20 border-2 border-dashed rounded-xl p-12 text-center text-muted-foreground">
+                <ScanSearch className="h-12 w-12 mx-auto mb-4 opacity-50" />
+                <h3 className="text-lg font-medium text-foreground">Siap Menganalisis {rawComments.length} Komentar</h3>
+                <p>Klik tombol "Mulai Scan AI" di atas untuk mendeteksi spam secara otomatis.</p>
+             </div>
         ) : (
-          // DAFTAR KOMENTAR
-          <div className="space-y-4">
-            {comments.map((thread) => {
-              const comment = thread.snippet.topLevelComment.snippet;
-              return (
-                <Card key={thread.id} className="border-none shadow-sm bg-card hover:bg-muted/20 transition-colors border-l-4 border-l-transparent hover:border-l-primary">
-                  <CardHeader className="flex flex-row gap-4 p-4 space-y-0 items-start">
-                    {/* Avatar */}
-                    <div className="h-10 w-10 relative rounded-full overflow-hidden flex-shrink-0 bg-muted border">
-                      <Image 
-                        src={comment.authorProfileImageUrl} 
-                        alt={comment.authorDisplayName} 
-                        fill
-                        className="object-cover"
-                        unoptimized
-                      />
-                    </div>
+            // TAMPILAN SUDAH SCAN
+            <Tabs defaultValue={reviewComments.length > 0 ? "review" : "safe"} className="w-full">
+                <TabsList className="grid w-full grid-cols-3 mb-8">
+                    <TabsTrigger value="safe" className="data-[state=active]:bg-green-100 data-[state=active]:text-green-900 dark:data-[state=active]:bg-green-900/30 dark:data-[state=active]:text-green-100">
+                        <CheckCircle className="w-4 h-4 mr-2" /> Aman ({safeComments.length})
+                    </TabsTrigger>
                     
-                    {/* Content */}
-                    <div className="space-y-1.5 w-full">
-                      <div className="flex items-center justify-between">
-                        <div className="flex flex-col sm:flex-row sm:items-center gap-0 sm:gap-2">
-                          <p className="text-sm font-semibold text-foreground">
-                            {comment.authorDisplayName}
-                          </p>
-                          <span className="text-xs text-muted-foreground">
-                            {new Date(comment.publishedAt).toLocaleDateString("id-ID")}
-                          </span>
-                        </div>
-                        
-                        {/* Likes on Comment */}
-                        {comment.likeCount > 0 && (
-                           <div className="flex items-center gap-1 text-xs text-muted-foreground bg-muted px-2 py-0.5 rounded-full">
-                              <ThumbsUp className="h-3 w-3" /> {comment.likeCount}
-                           </div>
-                        )}
-                      </div>
-                      
-                      <p className="text-sm leading-relaxed text-foreground/90">
-                        {comment.textDisplay}
-                      </p>
-                    </div>
-                  </CardHeader>
-                </Card>
-              );
-            })}
-          </div>
+                    <TabsTrigger value="review" className="relative data-[state=active]:bg-yellow-100 data-[state=active]:text-yellow-900 dark:data-[state=active]:bg-yellow-900/30 dark:data-[state=active]:text-yellow-100">
+                        <AlertTriangle className="w-4 h-4 mr-2" /> Butuh Tinjauan ({reviewComments.length})
+                        {reviewComments.length > 0 && <span className="absolute -top-2 -right-2 bg-red-500 text-white text-[10px] px-1.5 py-0.5 rounded-full animate-bounce">{reviewComments.length}</span>}
+                    </TabsTrigger>
+                    
+                    <TabsTrigger value="spam" className="data-[state=active]:bg-red-100 data-[state=active]:text-red-900 dark:data-[state=active]:bg-red-900/30 dark:data-[state=active]:text-red-100">
+                        <Trash2 className="w-4 h-4 mr-2" /> Auto Spam ({spamComments.length})
+                    </TabsTrigger>
+                </TabsList>
+
+                {/* TAB CONTENT: AMAN */}
+                <TabsContent value="safe" className="space-y-4 animate-in fade-in slide-in-from-bottom-2">
+                    {safeComments.length === 0 && <p className="text-center py-8 text-muted-foreground">Tidak ada komentar aman.</p>}
+                    {safeComments.map(c => <CommentCard key={c.id} data={c} type="safe" />)}
+                </TabsContent>
+
+                {/* TAB CONTENT: REVIEW */}
+                <TabsContent value="review" className="space-y-4 animate-in fade-in slide-in-from-bottom-2">
+                    <Alert variant="warning" className="bg-yellow-50 border-yellow-200 text-yellow-900 dark:bg-yellow-900/10 dark:text-yellow-100 dark:border-yellow-900 mb-4">
+                        <AlertTriangle className="h-4 w-4" />
+                        <AlertTitle>Perhatian Diperlukan</AlertTitle>
+                        <AlertDescription>
+                            AI mendeteksi potensi judi tapi skor keyakinan belum mencapai 90%. Silakan review manual.
+                        </AlertDescription>
+                    </Alert>
+                    
+                    {reviewComments.length === 0 && <div className="text-center py-12 bg-muted/20 rounded-lg">
+                        <CheckCircle className="h-10 w-10 mx-auto text-green-500 mb-2"/>
+                        <p className="font-medium">Bersih! Tidak ada komentar yang meragukan.</p>
+                    </div>}
+
+                    {reviewComments.map(c => <CommentCard key={c.id} data={c} type="review" />)}
+                </TabsContent>
+
+                {/* TAB CONTENT: SPAM */}
+                <TabsContent value="spam" className="space-y-4 animate-in fade-in slide-in-from-bottom-2">
+                    <Alert variant="destructive" className="mb-4">
+                        <Ban className="h-4 w-4" />
+                        <AlertTitle>Terdeteksi Berbahaya</AlertTitle>
+                        <AlertDescription>
+                            Komentar ini memiliki skor indikasi judi diatas 90%. Disarankan untuk dihapus.
+                        </AlertDescription>
+                    </Alert>
+
+                    {spamComments.length === 0 && <p className="text-center py-8 text-muted-foreground">Tidak ada spam terdeteksi.</p>}
+                    {spamComments.map(c => <CommentCard key={c.id} data={c} type="spam" />)}
+                </TabsContent>
+            </Tabs>
         )}
       </div>
     </div>
