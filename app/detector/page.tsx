@@ -18,42 +18,67 @@ import {
   ShieldCheck,
   Eraser,
   Search,
+  AlertCircle,
 } from "lucide-react";
-
-
-
 
 export default function DetectorPage() {
   const [inputText, setInputText] = useState("");
   const [isLoading, setIsLoading] = useState(false);
+  const [errorMsg, setErrorMsg] = useState<string | null>(null);
+  
   const [result, setResult] = useState<{
     isGambling: boolean;
     confidence: string;
+    original_text?: string;
   } | null>(null);
 
-  // TODO Func untuk check model
+  // Ambil URL dari Environment Variable
+  const API_URL = process.env.NEXT_PUBLIC_API_URL || "http://127.0.0.1:5000";
+
   const handleAnalyze = async () => {
     if (!inputText.trim()) return;
 
     setIsLoading(true);
     setResult(null);
+    setErrorMsg(null);
 
-    setTimeout(() => {
-      const lowerText = inputText.toLowerCase();
-      const isGambling = /slot|gacor|depo|maxwin/.test(lowerText);
-
-      setResult({
-        isGambling: isGambling,
-        confidence: isGambling ? "98.5%" : "99.1%",
+    try {
+      const response = await fetch(`${API_URL}/predict`, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({ text: inputText }),
       });
 
+      if (!response.ok) {
+        throw new Error(`Server Error: ${response.status}`);
+      }
+
+      const data = await response.json();
+
+      if (data.error) {
+        throw new Error(data.error);
+      }
+
+      setResult({
+        isGambling: data.is_gambling,
+        confidence: data.confidence, // Backend sudah mengirim format string (e.g. "98.5%")
+        original_text: data.original_text,
+      });
+
+    } catch (err) {
+      console.error("Error fetching data:", err);
+      setErrorMsg("Gagal menghubungi server AI. Pastikan Flask sudah berjalan.");
+    } finally {
       setIsLoading(false);
-    }, 1500);
+    }
   };
 
   const handleClear = () => {
     setInputText("");
     setResult(null);
+    setErrorMsg(null);
   };
 
   return (
@@ -114,7 +139,16 @@ export default function DetectorPage() {
           </CardFooter>
         </Card>
 
-        {/* Result Section*/}
+        {/* Error Alert */}
+        {errorMsg && (
+             <Alert variant="destructive">
+                <AlertCircle className="h-4 w-4" />
+                <AlertTitle>Error</AlertTitle>
+                <AlertDescription>{errorMsg}</AlertDescription>
+             </Alert>
+        )}
+
+        {/* Result Section */}
         {result && (
           <div className="animate-in fade-in slide-in-from-bottom-4 duration-500">
             <Alert
@@ -125,7 +159,6 @@ export default function DetectorPage() {
                   : "border-green-500 bg-green-50 dark:bg-green-900/10"
               }`}
             >
-
               {result.isGambling ? (
                 <ShieldAlert className="h-4 w-4" />
               ) : (
@@ -140,9 +173,8 @@ export default function DetectorPage() {
                 {result.isGambling ? "Terdeteksi Judi Online!" : "Konten Aman"}
               </AlertTitle>
 
-              <AlertDescription className="text-muted-foreground">
-                Sistem mendeteksi teks ini dengan tingkat keyakinan
-                (confidence):
+              <AlertDescription className="text-muted-foreground mt-1">
+                Sistem mendeteksi teks ini dengan tingkat keyakinan (confidence):
                 <span className="font-bold ml-1 text-foreground">
                   {result.confidence}
                 </span>

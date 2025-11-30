@@ -43,7 +43,7 @@ export default function Home() {
                 <ArrowRight className="ml-2 h-4 w-4" />
               </Button>
             </Link>
-            <Link href="https://github.com/username/repo-skripsi" target="_blank">
+            <Link href="https://github.com/RH203/fe-tugas-akhir" target="_blank">
               <Button variant="outline" size="lg" className="h-12 px-8">
                 <Github className="mr-2 h-4 w-4" />
                 Dokumentasi / Repo
